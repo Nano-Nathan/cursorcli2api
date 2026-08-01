@@ -461,7 +461,34 @@ export function buildToolCallSystemPrompt(tools: unknown[] | undefined): string 
     `- If you decide to call a tool, output ONLY the marker block above, nothing else.`,
     `- You may call only ONE tool at a time.`,
     `- If you do NOT need a tool, respond normally without any markers.`,
+    `- The arguments object must be strictly valid JSON. Escape newlines as \\n, tabs as \\t, and double quotes as \\" inside string values — never include a literal line break inside a JSON string.`,
   ].join("\n");
+}
+
+/**
+ * Best-effort repair for the most common LLM JSON-escaping mistake: literal
+ * control characters (raw newlines/tabs/CR) left unescaped inside a string
+ * value instead of \n/\t/\r (common with long multi-line shell/heredoc
+ * arguments). Walks the string with the same in-string tracking used by
+ * extractToolCallBlocks and escapes them before re-parsing.
+ */
+function repairUnescapedControlChars(json: string): string {
+  let out = "";
+  let inString = false;
+  let escape = false;
+  for (let i = 0; i < json.length; i++) {
+    const ch = json[i];
+    if (escape) { out += ch; escape = false; continue; }
+    if (ch === "\\") { out += ch; escape = true; continue; }
+    if (ch === '"') { inString = !inString; out += ch; continue; }
+    if (inString) {
+      if (ch === "\n") { out += "\\n"; continue; }
+      if (ch === "\r") { out += "\\r"; continue; }
+      if (ch === "\t") { out += "\\t"; continue; }
+    }
+    out += ch;
+  }
+  return out;
 }
 
 /**
@@ -519,22 +546,27 @@ export function parseToolCallResponse(
   let remaining = text;
 
   for (const block of blocks) {
+    let parsed: { name?: string; arguments?: unknown } | undefined;
     try {
-      const parsed = JSON.parse(block.json) as { name?: string; arguments?: unknown };
-      if (parsed.name) {
-        toolCalls.push({
-          id: `call_${randomCallId()}`,
-          type: "function",
-          function: {
-            name: parsed.name,
-            arguments: typeof parsed.arguments === "string"
-              ? parsed.arguments
-              : JSON.stringify(parsed.arguments ?? {}),
-          },
-        });
-      }
+      parsed = JSON.parse(block.json);
     } catch {
-      // not valid JSON, skip
+      try {
+        parsed = JSON.parse(repairUnescapedControlChars(block.json));
+      } catch {
+        // still not valid JSON even after repair, skip this block
+      }
+    }
+    if (parsed?.name) {
+      toolCalls.push({
+        id: `call_${randomCallId()}`,
+        type: "function",
+        function: {
+          name: parsed.name,
+          arguments: typeof parsed.arguments === "string"
+            ? parsed.arguments
+            : JSON.stringify(parsed.arguments ?? {}),
+        },
+      });
     }
     remaining = remaining.replace(block.fullMatch, "").trim();
   }

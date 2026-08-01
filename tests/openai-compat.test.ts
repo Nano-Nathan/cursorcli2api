@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   compatChatRequestToChatRequest,
   normalizeToolingRequest,
+  parseToolCallResponse,
   responsesRequestToChatRequest,
   type ChatCompletionRequest,
 } from "../src/lib/openai-compat.js";
@@ -113,4 +114,31 @@ test("compat and responses request conversion keep top-level tool fields availab
   const responsesExtra = (responsesRequest as Record<string, unknown>).model_extra as Record<string, unknown>;
   assert.deepEqual(responsesExtra.tools, [{ type: "function", function: { name: "lookup" } }]);
   assert.equal(responsesExtra.parallel_tool_calls, true);
+});
+
+test("parseToolCallResponse repairs an unescaped literal newline left inside a JSON string value", () => {
+  const marker = "___TOOL_CALL___";
+  // Simulates the real failure: a long multi-line shell/heredoc command where
+  // the model forgot to escape a line break as \n inside the JSON string.
+  const badJson = `{"name": "exec", "arguments": {"command": "echo start\nprint(1)\nprint(2)"}}`;
+  const raw = `Voy a ejecutar esto.\n${marker}\n${badJson}\n${marker}`;
+
+  const { text, toolCalls } = parseToolCallResponse(raw);
+
+  assert.ok(toolCalls, "expected the malformed block to be repaired and parsed");
+  assert.equal(toolCalls?.length, 1);
+  assert.equal(toolCalls?.[0].function.name, "exec");
+  const args = JSON.parse(toolCalls![0].function.arguments) as { command: string };
+  assert.equal(args.command, "echo start\nprint(1)\nprint(2)");
+  assert.ok(!text.includes(marker), "marker should not leak into the remaining/visible text");
+});
+
+test("parseToolCallResponse still returns null (unmodified text) for genuinely invalid JSON", () => {
+  const marker = "___TOOL_CALL___";
+  const raw = `${marker}\n{"name": "exec", "arguments": {oops this is not json}}\n${marker}`;
+
+  const { text, toolCalls } = parseToolCallResponse(raw);
+
+  assert.equal(toolCalls, null);
+  assert.equal(text, raw);
 });
