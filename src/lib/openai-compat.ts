@@ -461,16 +461,22 @@ export function buildToolCallSystemPrompt(tools: unknown[] | undefined): string 
     `- If you decide to call a tool, output ONLY the marker block above, nothing else.`,
     `- You may call only ONE tool at a time.`,
     `- If you do NOT need a tool, respond normally without any markers.`,
-    `- The arguments object must be strictly valid JSON. Escape newlines as \\n, tabs as \\t, and double quotes as \\" inside string values — never include a literal line break inside a JSON string.`,
+    `- The arguments object must be strictly valid JSON. Escape newlines as \\n, tabs as \\t, and double quotes as \\" inside string values — never include a literal line break inside a JSON string. Any backslash inside a string (e.g. a regex like \\. or \\d) must be doubled as \\\\. or \\\\d.`,
   ].join("\n");
 }
 
+const VALID_JSON_ESCAPES = new Set(['"', "\\", "/", "b", "f", "n", "r", "t", "u"]);
+
 /**
- * Best-effort repair for the most common LLM JSON-escaping mistake: literal
- * control characters (raw newlines/tabs/CR) left unescaped inside a string
- * value instead of \n/\t/\r (common with long multi-line shell/heredoc
- * arguments). Walks the string with the same in-string tracking used by
- * extractToolCallBlocks and escapes them before re-parsing.
+ * Best-effort repair for the most common LLM JSON-escaping mistakes inside a
+ * tool-call argument string:
+ *  - literal control characters (raw newlines/tabs/CR) instead of \n/\t/\r
+ *    (common with long multi-line shell/heredoc commands)
+ *  - lone backslashes not doubled for JSON, e.g. a regex like `\.` or `\d`
+ *    written as-is instead of `\\.`/`\\d` (common when the command contains
+ *    grep/sed/python regex patterns)
+ * Walks the string with the same in-string tracking used by
+ * extractToolCallBlocks and fixes them before re-parsing.
  */
 function repairUnescapedControlChars(json: string): string {
   let out = "";
@@ -478,7 +484,19 @@ function repairUnescapedControlChars(json: string): string {
   let escape = false;
   for (let i = 0; i < json.length; i++) {
     const ch = json[i];
-    if (escape) { out += ch; escape = false; continue; }
+    if (escape) {
+      // Right after a backslash inside a string: if it isn't one of JSON's
+      // recognized escapes, the model emitted a raw backslash (e.g. regex
+      // `\.`) without doubling it — double it now so it round-trips as a
+      // literal backslash followed by this character.
+      if (inString && !VALID_JSON_ESCAPES.has(ch)) {
+        out += "\\" + ch;
+      } else {
+        out += ch;
+      }
+      escape = false;
+      continue;
+    }
     if (ch === "\\") { out += ch; escape = true; continue; }
     if (ch === '"') { inString = !inString; out += ch; continue; }
     if (inString) {
@@ -557,16 +575,22 @@ export function parseToolCallResponse(
       }
     }
     if (parsed?.name) {
-      toolCalls.push({
-        id: `call_${randomCallId()}`,
-        type: "function",
-        function: {
-          name: parsed.name,
-          arguments: typeof parsed.arguments === "string"
-            ? parsed.arguments
-            : JSON.stringify(parsed.arguments ?? {}),
-        },
-      });
+      const argsStr = typeof parsed.arguments === "string"
+        ? parsed.arguments
+        : JSON.stringify(parsed.arguments ?? {});
+      // Cursor Agent's own stream sometimes re-emits the exact same marker
+      // block twice back-to-back (observed live). Executing the same call
+      // twice can be wasteful or unsafe for non-idempotent actions, so skip
+      // it when it's identical to the immediately preceding call.
+      const prev = toolCalls[toolCalls.length - 1];
+      const isDuplicateOfPrevious = prev?.function.name === parsed.name && prev?.function.arguments === argsStr;
+      if (!isDuplicateOfPrevious) {
+        toolCalls.push({
+          id: `call_${randomCallId()}`,
+          type: "function",
+          function: { name: parsed.name, arguments: argsStr },
+        });
+      }
     }
     remaining = remaining.replace(block.fullMatch, "").trim();
   }

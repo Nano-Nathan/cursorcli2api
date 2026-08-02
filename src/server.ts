@@ -1469,16 +1469,24 @@ async function handleChatCompletions(
                 }
 
                 if (delta) {
-                  sentContent = true;
                   assembledText += delta;
-                  const chunk = {
-                    id: respId,
-                    object: "chat.completion.chunk",
-                    created,
-                    model: requestedModelForResponse,
-                    choices: [{ index: 0, delta: { content: delta }, finish_reason: null }],
-                  };
-                  safeEnqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                  // cursor-agent + tools: the model may be mid-way through emitting a
+                  // ___TOOL_CALL___ marker block. Forwarding deltas live would leak
+                  // the raw marker text as visible content before we know whether
+                  // this turns into a tool call — buffer instead and flush once,
+                  // after the stream ends and we've checked.
+                  const withholdForToolCallCheck = provider === "cursor-agent" && !!requestTools?.length;
+                  if (!withholdForToolCallCheck) {
+                    sentContent = true;
+                    const chunk = {
+                      id: respId,
+                      object: "chat.completion.chunk",
+                      created,
+                      model: requestedModelForResponse,
+                      choices: [{ index: 0, delta: { content: delta }, finish_reason: null }],
+                    };
+                    safeEnqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                  }
                 }
               }
 
@@ -1491,6 +1499,18 @@ async function handleChatCompletions(
               const parsed = parseToolCallResponse(assembledText);
               if (parsed.toolCalls && parsed.toolCalls.length > 0) {
                 streamToolCalls = parsed.toolCalls as unknown as Record<string, unknown>[];
+              } else if (parsed.text) {
+                // Not a tool call after all — flush the buffered text now, once,
+                // as the (already marker-free) final answer.
+                sentContent = true;
+                const chunk = {
+                  id: respId,
+                  object: "chat.completion.chunk",
+                  created,
+                  model: requestedModelForResponse,
+                  choices: [{ index: 0, delta: { content: parsed.text }, finish_reason: null }],
+                };
+                safeEnqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
               }
             }
 
