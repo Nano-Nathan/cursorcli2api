@@ -73,8 +73,8 @@ import {
 } from "./providers/gemini-cloudcode.js";
 import {
   TextAssembler,
+  classifyCursorAgentAssistantEvent,
   iterStreamJsonEvents,
-  extractCursorAgentDelta,
   extractCursorAgentReasoningDelta,
   extractClaudeDelta,
   extractGeminiDelta,
@@ -926,7 +926,6 @@ async function handleChatCompletions(
       // ─── Non-streaming path ───────────────────────────────────────────────
       let text = "";
       let usage: Record<string, number> | null = null;
-      let reasoningContent = "";
 
       await acquireSemaphore();
       try {
@@ -1052,8 +1051,9 @@ async function handleChatCompletions(
           if (settings.cursor_agent_stream_partial_output) cmd.push("--stream-partial-output");
           const { cmd: finalCmd, stdinData } = buildCursorAgentCmd(cmd, prompt);
 
-          const assembler = new TextAssembler();
           const reasoningAssembler = new TextAssembler();
+          let narration = "";
+          let finalAnswerText: string | null = null;
           let fallbackText: string | null = null;
           for await (const evt of iterStreamJsonEvents({
             cmd: finalCmd,
@@ -1063,18 +1063,28 @@ async function handleChatCompletions(
             stdinData,
           })) {
             if (evt.type === "thinking") {
-              reasoningContent += extractCursorAgentReasoningDelta(evt, reasoningAssembler);
+              const t = extractCursorAgentReasoningDelta(evt, reasoningAssembler);
+              if (t) narration += t;
             } else {
-              extractCursorAgentDelta(evt, assembler);
+              const classified = classifyCursorAgentAssistantEvent(evt);
+              if (classified?.isFinal) {
+                finalAnswerText = classified.text;
+              } else if (classified?.text) {
+                narration += classified.text;
+              }
             }
             if (evt.type === "result" && typeof evt.result === "string") fallbackText = evt.result;
           }
-          text = assembler.text || fallbackText || "";
+          let answer = finalAnswerText ?? fallbackText ?? "";
           if (requestTools && requestTools.length > 0) {
-            const parsed = parseToolCallResponse(text);
-            text = parsed.text;
+            const parsed = parseToolCallResponse(answer);
+            answer = parsed.text;
             if (parsed.toolCalls) toolCalls = parsed.toolCalls as unknown as Record<string, unknown>[];
           }
+          // Match the old openclaw-cursor-brain plugin's "content" mode: the
+          // live narration (thinking + in-progress drafts) as a blockquote,
+          // then "---", then the real answer.
+          text = narration ? `> 💭 ${narration.replace(/\n/g, "\n> ")}\n\n---\n\n${answer}` : answer;
         } else if (provider === "claude") {
           const claudeModel = effectiveProviderModel ?? settings.claude_model ?? "sonnet";
           if (useClaudeOauth) {
@@ -1164,7 +1174,6 @@ async function handleChatCompletions(
       const finishReason = toolCalls?.length ? "tool_calls" : "stop";
       const message: Record<string, unknown> = { role: "assistant", content: text };
       if (toolCalls?.length) message.tool_calls = toolCalls;
-      if (reasoningContent) message.reasoning_content = reasoningContent;
 
       const response: Record<string, unknown> = {
         id: respId,
@@ -1220,6 +1229,25 @@ async function handleChatCompletions(
             let streamToolCalls: Record<string, unknown>[] | null = null;
             let assembledText = "";
             let sentContent = false;
+            // cursor-agent: narration (thinking + in-progress drafts) streams live
+            // as a "> 💭" blockquote; the one final canonical event is the real
+            // answer, flushed once after the loop (with "---" if narration ran).
+            let cursorAgentFinalAnswer: string | null = null;
+            let narrationStarted = false;
+            const emitCursorAgentNarration = (text: string) => {
+              const withContinuation = text.replace(/\n/g, "\n> ");
+              const chunkText = narrationStarted ? withContinuation : `> 💭 ${withContinuation}`;
+              narrationStarted = true;
+              sentContent = true;
+              const chunk = {
+                id: respId,
+                object: "chat.completion.chunk",
+                created,
+                model: requestedModelForResponse,
+                choices: [{ index: 0, delta: { content: chunkText }, finish_reason: null }],
+              };
+              safeEnqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+            };
 
             const attemptModels: (string | null)[] =
               provider === "codex"
@@ -1469,20 +1497,14 @@ async function handleChatCompletions(
                 } else if (provider === "cursor-agent") {
                   if (evt.type === "thinking") {
                     const reasoningDelta = extractCursorAgentReasoningDelta(evt, reasoningAssembler);
-                    if (reasoningDelta) {
-                      const reasoningChunk = {
-                        id: respId,
-                        object: "chat.completion.chunk",
-                        created,
-                        model: requestedModelForResponse,
-                        choices: [
-                          { index: 0, delta: { reasoning_content: reasoningDelta }, finish_reason: null },
-                        ],
-                      };
-                      safeEnqueue(encoder.encode(`data: ${JSON.stringify(reasoningChunk)}\n\n`));
-                    }
+                    if (reasoningDelta) emitCursorAgentNarration(reasoningDelta);
                   } else {
-                    delta = maybeStripAnswerTags(extractCursorAgentDelta(evt, assembler));
+                    const classified = classifyCursorAgentAssistantEvent(evt);
+                    if (classified?.isFinal) {
+                      cursorAgentFinalAnswer = classified.text;
+                    } else if (classified?.text) {
+                      emitCursorAgentNarration(classified.text);
+                    }
                   }
                 } else if (provider === "claude") {
                   delta = maybeStripAnswerTags(extractClaudeDelta(evt, assembler));
@@ -1494,24 +1516,18 @@ async function handleChatCompletions(
                 }
 
                 if (delta) {
+                  // Not reached for cursor-agent — it emits narration/final-answer
+                  // chunks directly above, bypassing this generic delta path.
                   assembledText += delta;
-                  // cursor-agent + tools: the model may be mid-way through emitting a
-                  // ___TOOL_CALL___ marker block. Forwarding deltas live would leak
-                  // the raw marker text as visible content before we know whether
-                  // this turns into a tool call — buffer instead and flush once,
-                  // after the stream ends and we've checked.
-                  const withholdForToolCallCheck = provider === "cursor-agent" && !!requestTools?.length;
-                  if (!withholdForToolCallCheck) {
-                    sentContent = true;
-                    const chunk = {
-                      id: respId,
-                      object: "chat.completion.chunk",
-                      created,
-                      model: requestedModelForResponse,
-                      choices: [{ index: 0, delta: { content: delta }, finish_reason: null }],
-                    };
-                    safeEnqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
-                  }
+                  sentContent = true;
+                  const chunk = {
+                    id: respId,
+                    object: "chat.completion.chunk",
+                    created,
+                    model: requestedModelForResponse,
+                    choices: [{ index: 0, delta: { content: delta }, finish_reason: null }],
+                  };
+                  safeEnqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
                 }
               }
 
@@ -1519,21 +1535,28 @@ async function handleChatCompletions(
               break;
             }
 
-            // cursor-agent tool call: check accumulated text for tool call markers at stream end
-            if (provider === "cursor-agent" && requestTools && requestTools.length > 0 && assembledText) {
-              const parsed = parseToolCallResponse(assembledText);
-              if (parsed.toolCalls && parsed.toolCalls.length > 0) {
-                streamToolCalls = parsed.toolCalls as unknown as Record<string, unknown>[];
-              } else if (parsed.text) {
-                // Not a tool call after all — flush the buffered text now, once,
-                // as the (already marker-free) final answer.
+            // cursor-agent: flush the one final canonical answer now, once. With
+            // tools, first check it for a marker-simulated tool call.
+            if (provider === "cursor-agent" && cursorAgentFinalAnswer) {
+              let finalText: string | null = cursorAgentFinalAnswer;
+              if (requestTools && requestTools.length > 0) {
+                const parsed = parseToolCallResponse(cursorAgentFinalAnswer);
+                if (parsed.toolCalls && parsed.toolCalls.length > 0) {
+                  streamToolCalls = parsed.toolCalls as unknown as Record<string, unknown>[];
+                  finalText = null;
+                } else {
+                  finalText = parsed.text;
+                }
+              }
+              if (finalText) {
+                if (narrationStarted) finalText = `\n\n---\n\n${finalText}`;
                 sentContent = true;
                 const chunk = {
                   id: respId,
                   object: "chat.completion.chunk",
                   created,
                   model: requestedModelForResponse,
-                  choices: [{ index: 0, delta: { content: parsed.text }, finish_reason: null }],
+                  choices: [{ index: 0, delta: { content: finalText }, finish_reason: null }],
                 };
                 safeEnqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
               }

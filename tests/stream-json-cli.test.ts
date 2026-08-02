@@ -11,7 +11,7 @@ import assert from "node:assert/strict";
 import {
   iterStreamJsonEvents,
   TextAssembler,
-  extractCursorAgentDelta,
+  classifyCursorAgentAssistantEvent,
   extractCursorAgentReasoningDelta,
 } from "../src/providers/stream-json-cli.js";
 
@@ -134,60 +134,26 @@ test("TextAssembler.feed never drops a short chunk that coincidentally starts li
   );
 });
 
-test("TextAssembler.reconcileFinal ignores a trailing full-text recap instead of duplicating it", () => {
-  // Reproduces a real cursor-agent --stream-partial-output capture: true
-  // incremental chunks (fed via feed()), then one final canonical event
-  // restating everything from the start (that event lacks timestamp_ms,
-  // which is why extractCursorAgentDelta routes it to reconcileFinal
-  // instead of feed() — see the dispatch test below).
-  const a = new TextAssembler();
-  const chunks = [
-    "Un pod de Kubernetes es la unidad mínima que el clúster realmente m",
-    "ueve: uno o más contenedores que viajan juntos, comparten red y almacenamiento, y viven (",
-    "y mueren) como un solo equipo. Si un contenedor es un m",
-    "úsico, el pod es la banda: no despliegas al baterista solo y",
-    " esperas que suene bien.",
-  ];
-  let assembled = "";
-  for (const c of chunks) {
-    assembled += a.feed(c);
-  }
-  assert.equal(assembled, chunks.join(""), "incremental chunks must assemble cleanly");
-
-  const recap = chunks.join(""); // the exact same full text, resent from scratch
-  assert.equal(a.reconcileFinal(recap), "", "the recap must not be re-emitted as a new delta");
-  assert.equal(a.text, chunks.join(""), "assembled text must stay as-is, not duplicated");
-});
-
-test("TextAssembler.reconcileFinal emits only the genuine new tail when the final event extends what was streamed", () => {
-  const a = new TextAssembler();
-  a.feed("Parte uno.");
-  assert.equal(a.reconcileFinal("Parte uno. Parte dos."), " Parte dos.");
-  assert.equal(a.text, "Parte uno. Parte dos.");
-});
-
-test("TextAssembler.reconcileFinal trusts a diverging final text without re-emitting mismatched content", () => {
-  const a = new TextAssembler();
-  a.feed("Borrador inicial");
-  // The canonical final text doesn't extend what was streamed at all —
-  // trust it for accounting, but don't try to patch up what already went out.
-  assert.equal(a.reconcileFinal("Texto final completamente distinto"), "");
-  assert.equal(a.text, "Texto final completamente distinto");
-});
-
-test("extractCursorAgentDelta routes events with timestamp_ms through feed(), others through reconcileFinal", () => {
-  const a = new TextAssembler();
+test("classifyCursorAgentAssistantEvent marks events with timestamp_ms as partial, others as final", () => {
   const mkEvt = (text: string, withTimestamp: boolean) => ({
     type: "assistant",
     message: { role: "assistant", content: [{ type: "text", text }] },
     ...(withTimestamp ? { timestamp_ms: "1785635558972" } : {}),
   });
 
-  assert.equal(extractCursorAgentDelta(mkEvt("Hola", true), a), "Hola");
-  assert.equal(extractCursorAgentDelta(mkEvt("Hola mundo", true), a), " mundo");
-  // Final canonical event (no timestamp_ms) recaps the same text — must not duplicate.
-  assert.equal(extractCursorAgentDelta(mkEvt("Hola mundo", false), a), "");
-  assert.equal(a.text, "Hola mundo");
+  // True partial-output deltas each carry timestamp_ms — narration, not the answer.
+  assert.deepEqual(classifyCursorAgentAssistantEvent(mkEvt("Un pod de Kuber", true)), {
+    text: "Un pod de Kuber",
+    isFinal: false,
+  });
+  // The one final canonical event lacks timestamp_ms — this is the real answer,
+  // taken verbatim, with no comparison against what was streamed as narration.
+  assert.deepEqual(
+    classifyCursorAgentAssistantEvent(mkEvt("Un pod de Kubernetes es la unidad mínima.", false)),
+    { text: "Un pod de Kubernetes es la unidad mínima.", isFinal: true }
+  );
+  assert.equal(classifyCursorAgentAssistantEvent({ type: "thinking", text: "no" }), null);
+  assert.equal(classifyCursorAgentAssistantEvent({ type: "assistant", message: null }), null);
 });
 
 test("extractCursorAgentReasoningDelta extracts thinking deltas and ignores the completed marker", () => {
