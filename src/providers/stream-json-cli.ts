@@ -44,9 +44,35 @@ export class TextAssembler {
       this.text = s;
       return delta;
     }
-    // Fallback: treat as delta chunk
+    // Genuinely new content that doesn't extend what we have.
     this.text += s;
     return s;
+  }
+
+  /**
+   * Reconciles a canonical, complete message against whatever has been fed
+   * so far via feed(). cursor-agent's --stream-partial-output sends true
+   * incremental deltas throughout (each carrying a `timestamp_ms` field),
+   * then one final "assistant" event that restates the *entire* response
+   * from the start rather than extending it (that final event lacks
+   * `timestamp_ms` — see extractCursorAgentDelta). Treating that final
+   * event as just another feed() call duplicates the opening of the reply;
+   * this instead trusts it as ground truth and only emits the part that
+   * hasn't already gone out.
+   */
+  reconcileFinal(full: string): string {
+    const s = full ?? '';
+    if (!s) return '';
+    if (s === this.text) return '';
+    if (s.startsWith(this.text)) {
+      const tail = s.slice(this.text.length);
+      this.text = s;
+      return tail;
+    }
+    // Diverges from what was already streamed — trust the canonical text
+    // for accounting, but don't try to patch up what the client already saw.
+    this.text = s;
+    return '';
   }
 }
 
@@ -273,6 +299,12 @@ export async function* iterStreamJsonEvents(
 
 /**
  * Extract text delta from cursor-agent events.
+ *
+ * cursor-agent tags every true partial-output "assistant" event with a
+ * `timestamp_ms` field; the one final "assistant" event that restates the
+ * complete response from scratch omits it. That presence/absence is a
+ * structural signal (not a text-similarity guess) for which event is a
+ * live delta to append vs. the canonical final message to reconcile against.
  */
 export function extractCursorAgentDelta(
   evt: Record<string, unknown>,
@@ -283,7 +315,28 @@ export function extractCursorAgentDelta(
   if (!message || typeof message !== 'object') return '';
   const content = (message as Record<string, unknown>).content;
   const incoming = normalizeMessageContent(content);
-  return assembler.feed(incoming);
+  const isPartialDelta = typeof evt.timestamp_ms !== 'undefined';
+  return isPartialDelta ? assembler.feed(incoming) : assembler.reconcileFinal(incoming);
+}
+
+/**
+ * Extract live "thinking" text from cursor-agent's --stream-partial-output
+ * events (type "thinking", subtype "delta"). The subtype "completed" event
+ * carries no text and just marks the end of the thinking phase. Routed
+ * through a TextAssembler (like assistant deltas) because long thinking
+ * traces have been observed to repeat/garble fragments when concatenated
+ * blindly; feed() is a no-op for genuinely new, non-overlapping chunks so
+ * this is safe even if that turns out not to be needed for a given turn.
+ */
+export function extractCursorAgentReasoningDelta(
+  evt: Record<string, unknown>,
+  assembler: TextAssembler
+): string {
+  if (evt.type !== 'thinking') return '';
+  if (evt.subtype !== 'delta') return '';
+  const text = evt.text;
+  if (typeof text !== 'string') return '';
+  return assembler.feed(text);
 }
 
 /**

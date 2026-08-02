@@ -75,6 +75,7 @@ import {
   TextAssembler,
   iterStreamJsonEvents,
   extractCursorAgentDelta,
+  extractCursorAgentReasoningDelta,
   extractClaudeDelta,
   extractGeminiDelta,
   extractUsageFromClaudeResult,
@@ -925,6 +926,7 @@ async function handleChatCompletions(
       // ─── Non-streaming path ───────────────────────────────────────────────
       let text = "";
       let usage: Record<string, number> | null = null;
+      let reasoningContent = "";
 
       await acquireSemaphore();
       try {
@@ -1051,6 +1053,7 @@ async function handleChatCompletions(
           const { cmd: finalCmd, stdinData } = buildCursorAgentCmd(cmd, prompt);
 
           const assembler = new TextAssembler();
+          const reasoningAssembler = new TextAssembler();
           let fallbackText: string | null = null;
           for await (const evt of iterStreamJsonEvents({
             cmd: finalCmd,
@@ -1059,7 +1062,11 @@ async function handleChatCompletions(
             killOnResult: true,
             stdinData,
           })) {
-            extractCursorAgentDelta(evt, assembler);
+            if (evt.type === "thinking") {
+              reasoningContent += extractCursorAgentReasoningDelta(evt, reasoningAssembler);
+            } else {
+              extractCursorAgentDelta(evt, assembler);
+            }
             if (evt.type === "result" && typeof evt.result === "string") fallbackText = evt.result;
           }
           text = assembler.text || fallbackText || "";
@@ -1157,6 +1164,7 @@ async function handleChatCompletions(
       const finishReason = toolCalls?.length ? "tool_calls" : "stop";
       const message: Record<string, unknown> = { role: "assistant", content: text };
       if (toolCalls?.length) message.tool_calls = toolCalls;
+      if (reasoningContent) message.reasoning_content = reasoningContent;
 
       const response: Record<string, unknown> = {
         id: respId,
@@ -1345,6 +1353,7 @@ async function handleChatCompletions(
               }
 
               const assembler = new TextAssembler();
+              const reasoningAssembler = new TextAssembler();
               let shouldRetry = false;
 
               const STREAM_END = Symbol("stream_end");
@@ -1458,7 +1467,23 @@ async function handleChatCompletions(
                     }
                   }
                 } else if (provider === "cursor-agent") {
-                  delta = maybeStripAnswerTags(extractCursorAgentDelta(evt, assembler));
+                  if (evt.type === "thinking") {
+                    const reasoningDelta = extractCursorAgentReasoningDelta(evt, reasoningAssembler);
+                    if (reasoningDelta) {
+                      const reasoningChunk = {
+                        id: respId,
+                        object: "chat.completion.chunk",
+                        created,
+                        model: requestedModelForResponse,
+                        choices: [
+                          { index: 0, delta: { reasoning_content: reasoningDelta }, finish_reason: null },
+                        ],
+                      };
+                      safeEnqueue(encoder.encode(`data: ${JSON.stringify(reasoningChunk)}\n\n`));
+                    }
+                  } else {
+                    delta = maybeStripAnswerTags(extractCursorAgentDelta(evt, assembler));
+                  }
                 } else if (provider === "claude") {
                   delta = maybeStripAnswerTags(extractClaudeDelta(evt, assembler));
                   if (evt.type === "result" && Array.isArray(evt.tool_calls) && evt.tool_calls.length > 0) {

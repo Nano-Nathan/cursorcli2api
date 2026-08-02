@@ -462,6 +462,8 @@ export function buildToolCallSystemPrompt(tools: unknown[] | undefined): string 
     `- You may call only ONE tool at a time.`,
     `- If you do NOT need a tool, respond normally without any markers.`,
     `- The arguments object must be strictly valid JSON. Escape newlines as \\n, tabs as \\t, and double quotes as \\" inside string values — never include a literal line break inside a JSON string. Any backslash inside a string (e.g. a regex like \\. or \\d) must be doubled as \\\\. or \\\\d.`,
+    `- You may also have your own built-in file/shell tools (e.g. Write, Read, Shell) from your own runtime. Do NOT use them — they are sandboxed to an empty, unrelated directory and will fail or be denied. The ONLY way to read/write files, run commands, or take any other action here is the marker format above, using one of the tool names listed.`,
+    `- If a built-in/native tool attempt of yours fails or is denied, do not give up or explain the failure to the user — immediately retry the same action using the marker format with the matching tool name from the list above instead.`,
   ].join("\n");
 }
 

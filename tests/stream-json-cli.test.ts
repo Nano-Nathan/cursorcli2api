@@ -8,7 +8,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { iterStreamJsonEvents, TextAssembler } from "../src/providers/stream-json-cli.js";
+import {
+  iterStreamJsonEvents,
+  TextAssembler,
+  extractCursorAgentDelta,
+  extractCursorAgentReasoningDelta,
+} from "../src/providers/stream-json-cli.js";
 
 test("iterStreamJsonEvents yields parsed NDJSON events from subprocess stdout", async () => {
   const events: Record<string, unknown>[] = [];
@@ -111,4 +116,102 @@ test("TextAssembler produces clean deltas from partial/full text", () => {
   assert.equal(a.text, "Hello WorldNew");
   assert.equal(a.feed(""), "");
   assert.equal(a.text, "Hello WorldNew");
+});
+
+test("TextAssembler.feed never drops a short chunk that coincidentally starts like the accumulated text", () => {
+  // feed() is only for genuine incremental deltas (each carries its own
+  // timestamp_ms upstream) — it must never guess "this looks like a recap"
+  // from text shape alone. A short unrelated chunk that happens to start
+  // with the same characters as the (much longer) accumulated text is
+  // common in natural language ("de", "la", "el", ...) and must be
+  // appended in full, not dropped.
+  const a = new TextAssembler();
+  a.feed("tu compañero de laboratorio con delirios de grandeza técnica y sarcasmo fino");
+  assert.equal(a.feed("tuañero"), "tuañero");
+  assert.equal(
+    a.text,
+    "tu compañero de laboratorio con delirios de grandeza técnica y sarcasmo finotuañero"
+  );
+});
+
+test("TextAssembler.reconcileFinal ignores a trailing full-text recap instead of duplicating it", () => {
+  // Reproduces a real cursor-agent --stream-partial-output capture: true
+  // incremental chunks (fed via feed()), then one final canonical event
+  // restating everything from the start (that event lacks timestamp_ms,
+  // which is why extractCursorAgentDelta routes it to reconcileFinal
+  // instead of feed() — see the dispatch test below).
+  const a = new TextAssembler();
+  const chunks = [
+    "Un pod de Kubernetes es la unidad mínima que el clúster realmente m",
+    "ueve: uno o más contenedores que viajan juntos, comparten red y almacenamiento, y viven (",
+    "y mueren) como un solo equipo. Si un contenedor es un m",
+    "úsico, el pod es la banda: no despliegas al baterista solo y",
+    " esperas que suene bien.",
+  ];
+  let assembled = "";
+  for (const c of chunks) {
+    assembled += a.feed(c);
+  }
+  assert.equal(assembled, chunks.join(""), "incremental chunks must assemble cleanly");
+
+  const recap = chunks.join(""); // the exact same full text, resent from scratch
+  assert.equal(a.reconcileFinal(recap), "", "the recap must not be re-emitted as a new delta");
+  assert.equal(a.text, chunks.join(""), "assembled text must stay as-is, not duplicated");
+});
+
+test("TextAssembler.reconcileFinal emits only the genuine new tail when the final event extends what was streamed", () => {
+  const a = new TextAssembler();
+  a.feed("Parte uno.");
+  assert.equal(a.reconcileFinal("Parte uno. Parte dos."), " Parte dos.");
+  assert.equal(a.text, "Parte uno. Parte dos.");
+});
+
+test("TextAssembler.reconcileFinal trusts a diverging final text without re-emitting mismatched content", () => {
+  const a = new TextAssembler();
+  a.feed("Borrador inicial");
+  // The canonical final text doesn't extend what was streamed at all —
+  // trust it for accounting, but don't try to patch up what already went out.
+  assert.equal(a.reconcileFinal("Texto final completamente distinto"), "");
+  assert.equal(a.text, "Texto final completamente distinto");
+});
+
+test("extractCursorAgentDelta routes events with timestamp_ms through feed(), others through reconcileFinal", () => {
+  const a = new TextAssembler();
+  const mkEvt = (text: string, withTimestamp: boolean) => ({
+    type: "assistant",
+    message: { role: "assistant", content: [{ type: "text", text }] },
+    ...(withTimestamp ? { timestamp_ms: "1785635558972" } : {}),
+  });
+
+  assert.equal(extractCursorAgentDelta(mkEvt("Hola", true), a), "Hola");
+  assert.equal(extractCursorAgentDelta(mkEvt("Hola mundo", true), a), " mundo");
+  // Final canonical event (no timestamp_ms) recaps the same text — must not duplicate.
+  assert.equal(extractCursorAgentDelta(mkEvt("Hola mundo", false), a), "");
+  assert.equal(a.text, "Hola mundo");
+});
+
+test("extractCursorAgentReasoningDelta extracts thinking deltas and ignores the completed marker", () => {
+  const a = new TextAssembler();
+  assert.equal(
+    extractCursorAgentReasoningDelta({ type: "thinking", subtype: "delta", text: "Pensando..." }, a),
+    "Pensando..."
+  );
+  assert.equal(extractCursorAgentReasoningDelta({ type: "thinking", subtype: "completed" }, a), "");
+  assert.equal(extractCursorAgentReasoningDelta({ type: "assistant", text: "no" }, a), "");
+});
+
+test("extractCursorAgentReasoningDelta dedupes a repeated thinking chunk instead of doubling it", () => {
+  // Regression: long thinking traces were observed to repeat/garble
+  // fragments when concatenated blindly (no assembler at all).
+  const a = new TextAssembler();
+  assert.equal(
+    extractCursorAgentReasoningDelta({ type: "thinking", subtype: "delta", text: "Comprobando permisos" }, a),
+    "Comprobando permisos"
+  );
+  assert.equal(
+    extractCursorAgentReasoningDelta({ type: "thinking", subtype: "delta", text: "Comprobando permisos" }, a),
+    "",
+    "an exact repeat of the same chunk must not be re-emitted"
+  );
+  assert.equal(a.text, "Comprobando permisos");
 });
