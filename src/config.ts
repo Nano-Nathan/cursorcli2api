@@ -288,6 +288,7 @@ export interface Settings {
   readonly cursor_agent_model: string | null;
   readonly cursor_agent_stream_partial_output: boolean;
   readonly cursor_agent_disable_indexing: boolean;
+  readonly cursor_agent_narrate_thinking: boolean;
   readonly cursor_agent_extra_args: readonly string[];
   readonly claude_bin: string;
   readonly claude_model: string | null;
@@ -411,6 +412,7 @@ function _createSettings(): Settings {
     cursor_agent_model: envStr("CURSOR_AGENT_MODEL", "").trim() || null,
     cursor_agent_stream_partial_output: envBool("CURSOR_AGENT_STREAM_PARTIAL_OUTPUT", true),
     cursor_agent_disable_indexing: envBool("CURSOR_AGENT_DISABLE_INDEXING", true),
+    cursor_agent_narrate_thinking: envBool("CURSOR_AGENT_NARRATE_THINKING", true),
     cursor_agent_extra_args: Object.freeze(
       parseShellArgs(process.env.CURSOR_AGENT_EXTRA_ARGS ?? "")
     ),

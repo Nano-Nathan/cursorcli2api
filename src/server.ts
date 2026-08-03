@@ -1052,6 +1052,7 @@ async function handleChatCompletions(
           const { cmd: finalCmd, stdinData } = buildCursorAgentCmd(cmd, prompt);
 
           const reasoningAssembler = new TextAssembler();
+          const narrateThinking = settings.cursor_agent_narrate_thinking;
           let narration = "";
           let finalAnswerText: string | null = null;
           let fallbackText: string | null = null;
@@ -1063,13 +1064,15 @@ async function handleChatCompletions(
             stdinData,
           })) {
             if (evt.type === "thinking") {
-              const t = extractCursorAgentReasoningDelta(evt, reasoningAssembler);
-              if (t) narration += t;
+              if (narrateThinking) {
+                const t = extractCursorAgentReasoningDelta(evt, reasoningAssembler);
+                if (t) narration += t;
+              }
             } else {
               const classified = classifyCursorAgentAssistantEvent(evt);
               if (classified?.isFinal) {
                 finalAnswerText = classified.text;
-              } else if (classified?.text) {
+              } else if (narrateThinking && classified?.text) {
                 narration += classified.text;
               }
             }
@@ -1083,8 +1086,9 @@ async function handleChatCompletions(
           }
           // Match the old openclaw-cursor-brain plugin's "content" mode: the
           // live narration (thinking + in-progress drafts) as a blockquote,
-          // then "---", then the real answer.
-          text = narration ? `> 💭 ${narration.replace(/\n/g, "\n> ")}\n\n---\n\n${answer}` : answer;
+          // then "---", then the real answer. Disabled entirely per-instance
+          // via CURSOR_AGENT_NARRATE_THINKING.
+          text = narrateThinking && narration ? `> 💭 ${narration.replace(/\n/g, "\n> ")}\n\n---\n\n${answer}` : answer;
         } else if (provider === "claude") {
           const claudeModel = effectiveProviderModel ?? settings.claude_model ?? "sonnet";
           if (useClaudeOauth) {
@@ -1496,13 +1500,15 @@ async function handleChatCompletions(
                   }
                 } else if (provider === "cursor-agent") {
                   if (evt.type === "thinking") {
-                    const reasoningDelta = extractCursorAgentReasoningDelta(evt, reasoningAssembler);
-                    if (reasoningDelta) emitCursorAgentNarration(reasoningDelta);
+                    if (settings.cursor_agent_narrate_thinking) {
+                      const reasoningDelta = extractCursorAgentReasoningDelta(evt, reasoningAssembler);
+                      if (reasoningDelta) emitCursorAgentNarration(reasoningDelta);
+                    }
                   } else {
                     const classified = classifyCursorAgentAssistantEvent(evt);
                     if (classified?.isFinal) {
                       cursorAgentFinalAnswer = classified.text;
-                    } else if (classified?.text) {
+                    } else if (settings.cursor_agent_narrate_thinking && classified?.text) {
                       emitCursorAgentNarration(classified.text);
                     }
                   }
