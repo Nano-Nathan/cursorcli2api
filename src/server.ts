@@ -2,7 +2,7 @@
  * Main Hono server. Ported from Python FastAPI server.py.
  */
 
-import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, existsSync, statSync } from "fs";
+import { mkdtempSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, existsSync, statSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { randomUUID } from "crypto";
@@ -87,6 +87,39 @@ import {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const logger = pino({ level: process.env.LOG_LEVEL ?? "info" });
+
+/**
+ * Whether to show cursor-agent's live thinking narration in the chat
+ * response. Read live from openclaw's own persisted config on every call
+ * (not just at process start) so it can be flipped without a restart.
+ * Falls back to CURSOR_AGENT_NARRATE_THINKING when the key is absent.
+ */
+function readLiveNarrateThinking(): boolean {
+  const dir = process.env.OPEN_CLAW_DIR;
+  if (dir) {
+    try {
+      const parsed = JSON.parse(readFileSync(join(dir, "openclaw.json"), "utf-8"));
+      const v = parsed?.cursorAgent?.narrateThinking;
+      if (typeof v === "boolean") return v;
+    } catch {
+      // fall through to the static default below
+    }
+  }
+  return settings.cursor_agent_narrate_thinking;
+}
+
+/** Always record the thinking narration, whether or not it's shown in chat. */
+function logThinkingNarration(narration: string): void {
+  if (!narration) return;
+  logger.info({ narration }, "cursor-agent thinking narration");
+  const dir = process.env.OPEN_CLAW_DIR;
+  if (!dir) return;
+  try {
+    appendFileSync(join(dir, "thinking.log"), `[${new Date().toISOString()}]\n${narration}\n\n`);
+  } catch {
+    // best-effort; never fail the request over logging
+  }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Hono app
@@ -1052,7 +1085,6 @@ async function handleChatCompletions(
           const { cmd: finalCmd, stdinData } = buildCursorAgentCmd(cmd, prompt);
 
           const reasoningAssembler = new TextAssembler();
-          const narrateThinking = settings.cursor_agent_narrate_thinking;
           let narration = "";
           let finalAnswerText: string | null = null;
           let fallbackText: string | null = null;
@@ -1063,16 +1095,16 @@ async function handleChatCompletions(
             killOnResult: true,
             stdinData,
           })) {
+            // Narration is always collected (so it can be logged below)
+            // regardless of whether it ends up shown in the chat response.
             if (evt.type === "thinking") {
-              if (narrateThinking) {
-                const t = extractCursorAgentReasoningDelta(evt, reasoningAssembler);
-                if (t) narration += t;
-              }
+              const t = extractCursorAgentReasoningDelta(evt, reasoningAssembler);
+              if (t) narration += t;
             } else {
               const classified = classifyCursorAgentAssistantEvent(evt);
               if (classified?.isFinal) {
                 finalAnswerText = classified.text;
-              } else if (narrateThinking && classified?.text) {
+              } else if (classified?.text) {
                 narration += classified.text;
               }
             }
@@ -1084,10 +1116,12 @@ async function handleChatCompletions(
             answer = parsed.text;
             if (parsed.toolCalls) toolCalls = parsed.toolCalls as unknown as Record<string, unknown>[];
           }
+          if (narration) logThinkingNarration(narration);
           // Match the old openclaw-cursor-brain plugin's "content" mode: the
           // live narration (thinking + in-progress drafts) as a blockquote,
-          // then "---", then the real answer. Disabled entirely per-instance
-          // via CURSOR_AGENT_NARRATE_THINKING.
+          // then "---", then the real answer. Shown only when narrateThinking
+          // is on (live-configurable via openclaw.json, see readLiveNarrateThinking).
+          const narrateThinking = readLiveNarrateThinking();
           text = narrateThinking && narration ? `> 💭 ${narration.replace(/\n/g, "\n> ")}\n\n---\n\n${answer}` : answer;
         } else if (provider === "claude") {
           const claudeModel = effectiveProviderModel ?? settings.claude_model ?? "sonnet";
@@ -1238,6 +1272,9 @@ async function handleChatCompletions(
             // answer, flushed once after the loop (with "---" if narration ran).
             let cursorAgentFinalAnswer: string | null = null;
             let narrationStarted = false;
+            let fullNarration = "";
+            // Read once per request; edit openclaw.json to flip it without restarting.
+            const narrateThinking = readLiveNarrateThinking();
             const emitCursorAgentNarration = (text: string) => {
               const withContinuation = text.replace(/\n/g, "\n> ");
               const chunkText = narrationStarted ? withContinuation : `> 💭 ${withContinuation}`;
@@ -1500,16 +1537,18 @@ async function handleChatCompletions(
                   }
                 } else if (provider === "cursor-agent") {
                   if (evt.type === "thinking") {
-                    if (settings.cursor_agent_narrate_thinking) {
-                      const reasoningDelta = extractCursorAgentReasoningDelta(evt, reasoningAssembler);
-                      if (reasoningDelta) emitCursorAgentNarration(reasoningDelta);
+                    const reasoningDelta = extractCursorAgentReasoningDelta(evt, reasoningAssembler);
+                    if (reasoningDelta) {
+                      fullNarration += reasoningDelta;
+                      if (narrateThinking) emitCursorAgentNarration(reasoningDelta);
                     }
                   } else {
                     const classified = classifyCursorAgentAssistantEvent(evt);
                     if (classified?.isFinal) {
                       cursorAgentFinalAnswer = classified.text;
-                    } else if (settings.cursor_agent_narrate_thinking && classified?.text) {
-                      emitCursorAgentNarration(classified.text);
+                    } else if (classified?.text) {
+                      fullNarration += classified.text;
+                      if (narrateThinking) emitCursorAgentNarration(classified.text);
                     }
                   }
                 } else if (provider === "claude") {
@@ -1540,6 +1579,8 @@ async function handleChatCompletions(
               if (shouldRetry) continue;
               break;
             }
+
+            if (provider === "cursor-agent" && fullNarration) logThinkingNarration(fullNarration);
 
             // cursor-agent: flush the one final canonical answer now, once. With
             // tools, first check it for a marker-simulated tool call.
