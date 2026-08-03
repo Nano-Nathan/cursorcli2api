@@ -319,8 +319,16 @@ export function extractCursorAgentReasoningDelta(
   if (evt.type !== 'thinking') return '';
   if (evt.subtype !== 'delta') return '';
   const text = evt.text;
-  if (typeof text !== 'string') return '';
-  return assembler.feed(text);
+  if (typeof text !== 'string' || !text) return '';
+  // subtype "delta" guarantees a genuine incremental fragment, never a
+  // cumulative snapshot - append unconditionally. TextAssembler.feed()'s
+  // startsWith-based snapshot detection is for providers (Claude) that
+  // resend cumulative text; using it here risked misfiring on a long
+  // thinking trace and corrupting it (dropped/garbled fragments). Only
+  // guard against the one confirmed real case: an exact whole-chunk resend.
+  if (text === assembler.text) return '';
+  assembler.text += text;
+  return text;
 }
 
 /**

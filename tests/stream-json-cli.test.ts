@@ -181,3 +181,22 @@ test("extractCursorAgentReasoningDelta dedupes a repeated thinking chunk instead
   );
   assert.equal(a.text, "Comprobando permisos");
 });
+
+test("extractCursorAgentReasoningDelta never drops characters on a long thinking trace", () => {
+  // Regression: a live long reasoning trace got progressively garbled
+  // ("FORJA" -> "ja", "acceso" -> "cceso") once the accumulated text grew
+  // past a short new chunk - caused by extractCursorAgentReasoningDelta
+  // routing through TextAssembler.feed()'s startsWith-based snapshot
+  // detection, which is for cumulative-snapshot providers (Claude), not
+  // cursor-agent's genuine per-event deltas.
+  const a = new TextAssembler();
+  const long = "Proposing a Spanish DevOps agent named FORJA to pair with PILA.";
+  extractCursorAgentReasoningDelta({ type: "thinking", subtype: "delta", text: long }, a);
+  const nextChunk = "Model selection is still open.";
+  const delta = extractCursorAgentReasoningDelta(
+    { type: "thinking", subtype: "delta", text: nextChunk },
+    a
+  );
+  assert.equal(delta, nextChunk, "the new chunk must be returned intact, not truncated");
+  assert.equal(a.text, long + nextChunk);
+});
